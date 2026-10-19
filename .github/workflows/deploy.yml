@@ -1,0 +1,87 @@
+name: Build, PWA check & Deploy (GitHub Pages)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Instalar dependencias
+        run: flutter pub get
+
+      - name: Análisis estático
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Pruebas de lógica
+        run: flutter test
+
+      - name: Compilar versión web
+        run: >
+          flutter build web --release --no-web-resources-cdn
+          --base-href "/${{ github.event.repository.name }}/"
+
+      - name: Activar service worker offline
+        run: cp build/web/pwa_sw.js build/web/flutter_service_worker.js
+
+      - name: Verificar que sigue siendo PWA
+        run: |
+          set -e
+          test -f build/web/manifest.json || { echo "Falta manifest.json"; exit 1; }
+          test -f build/web/flutter_service_worker.js || { echo "Falta service worker"; exit 1; }
+          grep -q 'rel="manifest"' build/web/index.html || { echo "index.html no enlaza el manifest"; exit 1; }
+          grep -q 'serviceWorker' build/web/index.html || { echo "index.html no registra el service worker"; exit 1; }
+          python3 - <<'EOF'
+          import json, os, sys
+          m = json.load(open('build/web/manifest.json'))
+          for key in ['name', 'short_name', 'start_url', 'display', 'icons']:
+              if key not in m:
+                  sys.exit(f'manifest.json sin "{key}"')
+          if m['display'] not in ('standalone', 'fullscreen', 'minimal-ui'):
+              sys.exit('display debe ser standalone/fullscreen/minimal-ui')
+          sizes = {i.get('sizes') for i in m['icons']}
+          if not {'192x192', '512x512'} <= sizes:
+              sys.exit('Faltan iconos 192x192 y/o 512x512')
+          for icon in m['icons']:
+              if not os.path.exists(os.path.join('build/web', icon['src'])):
+                  sys.exit(f"No existe el icono {icon['src']}")
+          print('PWA OK: manifest válido, iconos presentes y service worker listo')
+          EOF
+
+      - name: Subir artefacto para Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/web
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Desplegar en GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
